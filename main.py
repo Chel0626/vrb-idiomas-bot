@@ -2,9 +2,11 @@
 import os
 import logging
 import google.generativeai as genai
+from openai import OpenAI
 from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from pathlib import Path
 
 # --- CONFIGURAÇÕES ---
 logging.basicConfig(
@@ -13,16 +15,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Carrega as chaves das variáveis de ambiente
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+# Configura as APIs
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI()
 
-# --- MASTERPROMPT VRB PARA IDIOMAS ---
-# Este é o "cérebro" que define a personalidade do bot.
+# --- MASTERPROMPT VRB PARA IDIOMAS (COMPLETO) ---
 VRB_MASTERPROMPT = """
 # 1. PERSONA E DIRETRIZES MESTRAS (MÉTODO VRB PARA IDIOMAS)
 
@@ -72,42 +77,94 @@ O usuário disse:
 ---
 """
 
+# --- FUNÇÕES AUXILIARES ---
+async def get_gemini_response(user_message: str) -> str:
+    """Função centralizada para obter resposta do Gemini."""
+    prompt_completo = VRB_MASTERPROMPT.format(user_message=user_message)
+    try:
+        response = gemini_model.generate_content(prompt_completo)
+        return response.text
+    except Exception as e:
+        logger.error(f"Erro ao chamar a API do Gemini: {e}")
+        return "Desculpe, tive um problema para pensar na resposta. Tente novamente."
+
 # --- LÓGICA DO BOT TELEGRAM ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Envia uma mensagem de boas-vindas."""
     user = update.effective_user
     await update.message.reply_html(
-        f"Olá {user.mention_html()}! Sou o VRB Idiomas, seu parceiro para praticar conversação. Vamos começar? Tente me dizer 'Hello, how are you?' em inglês!",
+        f"Olá {user.mention_html()}! Sou o VRB Idiomas. Agora você pode me enviar mensagens de texto ou de voz para praticarmos!",
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Envia a mensagem do usuário para o Gemini com o Masterprompt."""
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processa mensagens de texto."""
     user_message = update.message.text
-    logger.info(f"Recebida mensagem do usuário: {user_message}")
+    logger.info(f"Recebida mensagem de texto: {user_message}")
+    response_text = await get_gemini_response(user_message)
+    await update.message.reply_text(response_text)
 
-    # Formata o prompt final com a mensagem do usuário
-    prompt_completo = VRB_MASTERPROMPT.format(user_message=user_message)
-
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processa mensagens de voz."""
+    logger.info("Recebida mensagem de voz.")
+    
+    voice_file_path = Path(f"{update.message.voice.file_id}.ogg")
+    
     try:
-        response = model.generate_content(prompt_completo)
-        await update.message.reply_text(response.text)
+        # 1. Baixa o arquivo de áudio do Telegram
+        voice_file = await context.bot.get_file(update.message.voice.file_id)
+        await voice_file.download_to_drive(voice_file_path)
+        
+        # 2. Transcreve o áudio com o Whisper
+        with open(voice_file_path, "rb") as audio_file:
+            transcription = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        transcribed_text = transcription.text
+        logger.info(f"Texto transcrito: {transcribed_text}")
+        await update.message.reply_text(f"Eu ouvi: \"{transcribed_text}\"")
+
+        # 3. Obtém a resposta do Gemini para o texto transcrito
+        response_text = await get_gemini_response(transcribed_text)
+
+        # 4. Converte a resposta em áudio com a API de TTS da OpenAI
+        speech_file_path = Path("response.mp3")
+        tts_response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=response_text
+        )
+        tts_response.stream_to_file(speech_file_path)
+        
+        # 5. Envia a resposta em áudio de volta para o usuário
+        await update.message.reply_voice(voice=open(speech_file_path, "rb"))
+
     except Exception as e:
-        logger.error(f"Erro ao chamar a API do Gemini: {e}")
-        await update.message.reply_text("Desculpe, tive um problema para pensar na resposta. Tente novamente.")
+        logger.error(f"Erro no processamento de voz: {e}")
+        await update.message.reply_text("Desculpe, tive um problema para processar seu áudio.")
+    finally:
+        # Limpa os arquivos temporários
+        if voice_file_path.exists():
+            voice_file_path.unlink()
+        if 'speech_file_path' in locals() and speech_file_path.exists():
+            speech_file_path.unlink()
 
 # --- CONFIGURAÇÃO DO WEBHOOK ---
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "VRB Idiomas Bot is running with VRB Masterprompt personality!"}
+    return {"status": "ok", "message": "VRB Idiomas Bot is running with Voice!"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     """Processa as atualizações do Telegram."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Adiciona os handlers para cada tipo de mensagem
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
     try:
         await application.initialize()
