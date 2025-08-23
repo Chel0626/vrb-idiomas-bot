@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from pathlib import Path
+from supabase import create_client, Client
 
 # --- CONFIGURAÇÕES ---
 logging.basicConfig(
@@ -19,15 +20,18 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
-# Configura as APIs
+# Configura as APIs e Clientes
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
-# --- MASTERPROMPT VRB PARA IDIOMAS (COMPLETO) ---
+# --- MASTERPROMPT VRB PARA IDIOMAS (COMPLETO E INTEGRADO) ---
 VRB_MASTERPROMPT = """
 # 1. PERSONA E DIRETRIZES MESTRAS (MÉTODO VRB PARA IDIOMAS)
 
@@ -66,21 +70,53 @@ VRB_MASTERPROMPT = """
     3.  **Social:** Falar sobre hobbies, trabalho, família, planos para o fim de semana.
     4.  **Avançado:** Discutir um filme, dar sua opinião sobre um assunto, contar uma história.
 
-# 3. COMANDOS E INTERAÇÃO
+# 3. HISTÓRICO DA CONVERSA RECENTE
+A seguir está o histórico da conversa até agora. Use-o para entender o contexto.
+---
+{chat_history}
+---
 
-- **Início da Conversa:** O usuário inicia com qualquer mensagem. O comando `/start` serve para apresentar a persona.
-- **Mudança de Cenário:** O usuário pode pedir para mudar o cenário (ex: "Agora vamos imaginar que estou em um hotel").
-
+# 4. MENSAGEM ATUAL DO USUÁRIO
 O usuário disse:
 ---
 {user_message}
 ---
 """
 
+# --- FUNÇÕES DE BANCO DE DADOS (A MEMÓRIA) ---
+
+def get_conversation_history(chat_id: int, limit: int = 6) -> str:
+    """Busca o histórico recente da conversa no Supabase."""
+    try:
+        data = supabase.table('conversations').select('role, content').eq('chat_id', chat_id).order('created_at', desc=True).limit(limit).execute()
+        
+        if not data.data:
+            return "Nenhum histórico encontrado."
+
+        history = "\n".join([f"{item['role']}: {item['content']}" for item in reversed(data.data)])
+        return history
+    except Exception as e:
+        logger.error(f"Erro ao buscar histórico no Supabase: {e}")
+        return "Erro ao buscar histórico."
+
+def save_message(chat_id: int, role: str, content: str):
+    """Salva uma nova mensagem no histórico da conversa no Supabase."""
+    try:
+        supabase.table('conversations').insert({
+            'chat_id': chat_id,
+            'role': role,
+            'content': content
+        }).execute()
+    except Exception as e:
+        logger.error(f"Erro ao salvar mensagem no Supabase: {e}")
+
 # --- FUNÇÕES AUXILIARES ---
-async def get_gemini_response(user_message: str) -> str:
-    """Função centralizada para obter resposta do Gemini."""
-    prompt_completo = VRB_MASTERPROMPT.format(user_message=user_message)
+
+async def get_gemini_response(chat_id: int, user_message: str) -> str:
+    """Função centralizada para obter resposta do Gemini, agora com memória."""
+    chat_history = get_conversation_history(chat_id)
+    prompt_completo = VRB_MASTERPROMPT.format(chat_history=chat_history, user_message=user_message)
+    
     try:
         response = gemini_model.generate_content(prompt_completo)
         return response.text
@@ -94,57 +130,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Envia uma mensagem de boas-vindas."""
     user = update.effective_user
     await update.message.reply_html(
-        f"Olá {user.mention_html()}! Sou o VRB Idiomas. Agora você pode me enviar mensagens de texto ou de voz para praticarmos!",
+        f"Olá {user.mention_html()}! Sou o VRB Idiomas com memória. Nossa conversa será contínua. Envie texto ou voz para praticarmos!",
     )
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processa mensagens de texto."""
+    """Processa mensagens de texto com memória."""
+    chat_id = update.message.chat_id
     user_message = update.message.text
-    logger.info(f"Recebida mensagem de texto: {user_message}")
-    response_text = await get_gemini_response(user_message)
+    logger.info(f"Recebida mensagem de texto do chat_id {chat_id}: {user_message}")
+
+    save_message(chat_id, 'user', user_message)
+    response_text = await get_gemini_response(chat_id, user_message)
+    save_message(chat_id, 'assistant', response_text)
+    
     await update.message.reply_text(response_text)
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processa mensagens de voz."""
-    logger.info("Recebida mensagem de voz.")
+    """Processa mensagens de voz com memória."""
+    chat_id = update.message.chat_id
+    logger.info(f"Recebida mensagem de voz do chat_id {chat_id}.")
     
     voice_file_path = Path(f"{update.message.voice.file_id}.ogg")
     
     try:
-        # 1. Baixa o arquivo de áudio do Telegram
         voice_file = await context.bot.get_file(update.message.voice.file_id)
         await voice_file.download_to_drive(voice_file_path)
         
-        # 2. Transcreve o áudio com o Whisper
         with open(voice_file_path, "rb") as audio_file:
-            transcription = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
+            transcription = openai_client.audio.transcriptions.create(model="whisper-1", file=audio_file)
         transcribed_text = transcription.text
         logger.info(f"Texto transcrito: {transcribed_text}")
         await update.message.reply_text(f"Eu ouvi: \"{transcribed_text}\"")
 
-        # 3. Obtém a resposta do Gemini para o texto transcrito
-        response_text = await get_gemini_response(transcribed_text)
+        save_message(chat_id, 'user', transcribed_text)
+        response_text = await get_gemini_response(chat_id, transcribed_text)
+        save_message(chat_id, 'assistant', response_text)
 
-        # 4. Converte a resposta em áudio com a API de TTS da OpenAI
         speech_file_path = Path("response.mp3")
-        tts_response = openai_client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=response_text
-        )
+        tts_response = openai_client.audio.speech.create(model="tts-1", voice="alloy", input=response_text)
         tts_response.stream_to_file(speech_file_path)
-        
-        # 5. Envia a resposta em áudio de volta para o usuário
         await update.message.reply_voice(voice=open(speech_file_path, "rb"))
 
     except Exception as e:
         logger.error(f"Erro no processamento de voz: {e}")
         await update.message.reply_text("Desculpe, tive um problema para processar seu áudio.")
     finally:
-        # Limpa os arquivos temporários
         if voice_file_path.exists():
             voice_file_path.unlink()
         if 'speech_file_path' in locals() and speech_file_path.exists():
@@ -154,14 +184,13 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "VRB Idiomas Bot is running with Voice!"}
+    return {"status": "ok", "message": "VRB Idiomas Bot is running with Memory and Voice!"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     """Processa as atualizações do Telegram."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Adiciona os handlers para cada tipo de mensagem
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
